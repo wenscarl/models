@@ -25,14 +25,62 @@ from keras import initializers
 from keras import regularizers
 from keras.engine.base_layer import Layer
 
+import keras.backend as K
 # isort: off
 from tensorflow.python.util.tf_export import keras_export
+from tensorflow.python.framework import dtypes
 
+init_val_scalar = 0.8
+
+FAKE_E4M3 = dtypes.float8_e4m3fn
+FAKE_E5M2 = dtypes.float8_e5m2
+
+E4M3_MAX = 448.
+E5M2_MAX = 57344.
+AMAX_HIS_LEN = 16
+
+
+def get_fp8_max(fake_dtype):
+  if fake_dtype == FAKE_E4M3:
+    return E4M3_MAX
+  else:
+    assert fake_dtype == FAKE_E5M2
+    return E5M2_MAX
+
+
+def quantize(x, quantized_dtype, scale):
+  dtype_max = get_fp8_max(quantized_dtype)
+  scaled_x = tf.clip_by_value(x / scale, -dtype_max, dtype_max)
+  return tf.cast(scaled_x, quantized_dtype)
+
+
+def dequantize(x, wide_dtype, scale):
+  return tf.cast(x, wide_dtype) * scale
+
+
+def quantize_dequantize(x, quantized_dtype, scale):
+  orig_dtype = x.dtype
+  qx = quantize(x, quantized_dtype, scale)
+  return dequantize(qx, orig_dtype, scale)
+
+def update_scale(x, quantized_dtype, scale_var, amax_history):
+  dtype_max = get_fp8_max(quantized_dtype)
+  amax_current = tf.cast(tf.math.reduce_max(tf.math.abs(x)), scale_var.dtype)
+  amax_his_tsr = tf.tensor_scatter_nd_update(tf.roll(amax_history.read_value(), 1, 0),[[0]],[amax_current])
+  amax_history.assign(amax_his_tsr)
+  amax_temp = tf.reduce_max(amax_history, axis=0)
+  amax = tf.maximum(amax_temp, 2 ** -10)
+  scale_var.assign(1.1 * amax / dtype_max)
+
+def qdq_and_update(x, dtype, scale_var, amax_history):
+  qx = quantize_dequantize(x, dtype, scale_var)
+  update_scale(x, dtype, scale_var, amax_history)
+  return qx
 
 @keras_export(
     "keras.layers.EinsumDense", "keras.layers.experimental.EinsumDense"
 )
-class EinsumDense(Layer):
+class EinsumDenseFp8(Layer):
     """A layer that uses `tf.einsum` as the backing computation.
 
     This layer can perform einsum calculations of arbitrary dimensionality.
@@ -127,6 +175,7 @@ class EinsumDense(Layer):
         activity_regularizer=None,
         kernel_constraint=None,
         bias_constraint=None,
+        use_variable=True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -143,6 +192,7 @@ class EinsumDense(Layer):
         self.bias_regularizer = regularizers.get(bias_regularizer)
         self.kernel_constraint = constraints.get(kernel_constraint)
         self.bias_constraint = constraints.get(bias_constraint)
+        self.use_variable = use_variable
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
@@ -175,6 +225,29 @@ class EinsumDense(Layer):
             )
         else:
             self.bias = None
+        init_val = tf.keras.initializers.Constant(init_val_scalar)
+        self.input_amax_history = self.add_weight(
+            "input_amax_history", shape=(AMAX_HIS_LEN,),
+            initializer=init_val, trainable=False)
+        self.input_scale = self.add_weight("input_scale", shape=(),
+                                           initializer=init_val, trainable=False)
+        self.kernel_amax_history = self.add_weight(
+            "kernel_amax_history", shape=(AMAX_HIS_LEN,),
+            initializer=init_val, trainable=False)
+        self.kernel_scale = self.add_weight("kernel_scale", shape=(),
+                                            initializer=init_val, trainable=False)
+        self.input_grad_amax_history = self.add_weight(
+            "input_grad_amax_history", shape=(AMAX_HIS_LEN,),
+            initializer=init_val, trainable=False)
+        self.input_grad_scale = self.add_weight("input_grad_scale", shape=(),
+                                                initializer=init_val,
+                                                trainable=False)
+        self.output_grad_amax_history = self.add_weight(
+            "output_grad_amax_history", shape=(AMAX_HIS_LEN,),
+            initializer=init_val, trainable=False)
+        self.output_grad_scale = self.add_weight(
+            "output_grad_scale", shape=(),
+            initializer=init_val, trainable=False)
         super().build(input_shape)
 
     def compute_output_shape(self, _):
@@ -203,8 +276,42 @@ class EinsumDense(Layer):
         base_config = super().get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
+    @tf.custom_gradient
+    def in_qdq(self, input):
+      """Quantize-dequantize both the input and the input's gradient."""
+      qin = qdq_and_update(input, FAKE_E4M3, self.input_scale, self.input_amax_history)
+
+      def grad(in_grad):
+        in_grad_ret = qdq_and_update(in_grad, FAKE_E5M2, self.input_grad_scale, 
+                                     self.input_grad_amax_history)
+        return in_grad_ret
+  
+      return qin, grad
+  
+    @tf.custom_gradient
+    def identity_qdq(self, output):
+      """Quantize-dequantize both the output and the output's gradient, only if the next layer(in fwd sense) doesn't support fp8."""
+      def grad(out_grad):
+        return qdq_and_update(
+            out_grad, FAKE_E5M2, self.output_grad_scale, self.
+            output_grad_amax_history)
+      return output, grad
+  
+    @tf.custom_gradient
+    def kernel_qdq(self, kernel):
+      """Quantize-dequantize the kernel but not its gradient."""
+
+      qkernel  = qdq_and_update(kernel, FAKE_E4M3, self.kernel_scale, 
+                                self.kernel_amax_history)
+  
+      def grad(kernel_grad):
+        return kernel_grad
+  
+      return qkernel, grad
+
     def call(self, inputs):
-        ret = tf.einsum(self.equation, inputs, self.kernel)
+        ret = tf.einsum(self.equation, self.in_qdq(inputs), 
+                        self.kernel_qdq(self.kernel))
         if self.bias is not None:
             ret += self.bias
         if self.activation is not None:
