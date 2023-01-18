@@ -30,7 +30,10 @@ from official.legacy.bert import run_squad_helper
 from official.nlp.data import squad_lib as squad_lib_wp
 from official.nlp.tools import tokenization
 from official.utils.misc import keras_utils
+import EinsumDenseFp8 as einsum_dense_fp8
 
+# hijack keras's EinsumDense layer
+tf.keras.layers.EinsumDense = einsum_dense_fp8.EinsumDenseFp8
 
 flags.DEFINE_string('vocab_file', None,
                     'The vocabulary file that the BERT model was trained on.')
