@@ -50,12 +50,19 @@ def get_fp8_max(fake_dtype):
 
 def quantize(x, quantized_dtype, scale):
   dtype_max = get_fp8_max(quantized_dtype)
-  scaled_x = tf.clip_by_value(x / scale, -dtype_max, dtype_max)
+  policy = tf.keras.mixed_precision.global_policy()
+  is_mixed_policy = (
+        policy is not None and policy.compute_dtype != policy.variable_dtype
+  )
+
+  if is_mixed_policy:
+    scaled_x = tf.clip_by_value(x / tf.cast(scale, tf.float16), -dtype_max, dtype_max)
+  else:
+    scaled_x = tf.clip_by_value(x / scale, -dtype_max, dtype_max)
   return tf.cast(scaled_x, quantized_dtype)
 
-
 def dequantize(x, wide_dtype, scale):
-  return tf.cast(x, wide_dtype) * scale
+  return tf.cast(x, wide_dtype) * tf.cast(scale, wide_dtype)
 
 
 def quantize_dequantize(x, quantized_dtype, scale):
@@ -67,10 +74,10 @@ def update_scale(x, quantized_dtype, scale_var, amax_history):
   dtype_max = get_fp8_max(quantized_dtype)
   amax_current = tf.cast(tf.math.reduce_max(tf.math.abs(x)), scale_var.dtype)
   amax_his_tsr = tf.tensor_scatter_nd_update(tf.roll(amax_history.read_value(), 1, 0),[[0]],[amax_current])
-  amax_history.assign(amax_his_tsr)
+  amax_history.assign(tf.cast(amax_his_tsr, amax_history.dtype))
   amax_temp = tf.reduce_max(amax_history, axis=0)
   amax = tf.maximum(amax_temp, 2 ** -10)
-  scale_var.assign(1.1 * amax / dtype_max)
+  scale_var.assign(tf.cast(1.1 * amax / dtype_max,scale_var.dtype ))
 
 def qdq_and_update(x, dtype, scale_var, amax_history):
   qx = quantize_dequantize(x, dtype, scale_var)
@@ -282,36 +289,43 @@ class EinsumDenseFp8(Layer):
       qin = qdq_and_update(input, FAKE_E4M3, self.input_scale, self.input_amax_history)
 
       def grad(in_grad):
-        in_grad_ret = qdq_and_update(in_grad, FAKE_E5M2, self.input_grad_scale, 
+        in_grad_ret = qdq_and_update(in_grad, FAKE_E5M2, self.input_grad_scale,
                                      self.input_grad_amax_history)
         return in_grad_ret
-  
+
       return qin, grad
   
     @tf.custom_gradient
-    def identity_qdq(self, output):
+    def out_qdq(self, output):
       """Quantize-dequantize both the output and the output's gradient, only if the next layer(in fwd sense) doesn't support fp8."""
+#      output = qdq_and_update(output, FAKE_E4M3, self.output_scale, self.output_amax_history)
       def grad(out_grad):
         return qdq_and_update(
             out_grad, FAKE_E5M2, self.output_grad_scale, self.
             output_grad_amax_history)
       return output, grad
+
   
     @tf.custom_gradient
     def kernel_qdq(self, kernel):
       """Quantize-dequantize the kernel but not its gradient."""
 
-      qkernel  = qdq_and_update(kernel, FAKE_E4M3, self.kernel_scale, 
+      qkernel  = qdq_and_update(kernel, FAKE_E4M3, self.kernel_scale,
                                 self.kernel_amax_history)
-  
+
       def grad(kernel_grad):
-        return kernel_grad
-  
+        kernel_grad_ret = qdq_and_update(kernel_grad, FAKE_E4M3, self.kernel_grad_scale,
+                                         self.kernel_grad_amax_history)
+        return kernel_grad_ret
+
       return qkernel, grad
+
 
     def call(self, inputs):
         ret = tf.einsum(self.equation, self.in_qdq(inputs), 
                         self.kernel_qdq(self.kernel))
+        if self.is_last:
+            ret = self.out_qdq(ret)
         if self.bias is not None:
             ret += self.bias
         if self.activation is not None:
