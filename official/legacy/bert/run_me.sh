@@ -22,7 +22,7 @@ TF_DUMP_GRAPH_PREFIX=/tmp/generated TF_XLA_FLAGS="--tf_xla_clustering_debug --tf
  --num_train_epochs=2 \
  --model_dir=/joc/my_bert_model \
  --enable_xla=true \
- --dtype=fp32 \
+ --dtype=fp16 \
  --distribution_strategy=mirrored
        &> log.tmp
 
