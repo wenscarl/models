@@ -34,6 +34,7 @@ import EinsumDenseFp8 as einsum_dense_fp8
 
 # hijack keras's EinsumDense layer
 tf.keras.layers.EinsumDense = einsum_dense_fp8.EinsumDenseFp8
+tf.keras.layers.Dense = dense_fp8.DenseFp8
 
 flags.DEFINE_string('vocab_file', None,
                     'The vocabulary file that the BERT model was trained on.')
