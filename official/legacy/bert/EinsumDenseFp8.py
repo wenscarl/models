@@ -47,7 +47,6 @@ def get_fp8_max(fake_dtype):
     assert fake_dtype == FAKE_E5M2
     return E5M2_MAX
 
-
 def quantize(x, quantized_dtype, scale):
   dtype_max = get_fp8_max(quantized_dtype)
   policy = tf.keras.mixed_precision.global_policy()
@@ -59,10 +58,13 @@ def quantize(x, quantized_dtype, scale):
     scaled_x = tf.clip_by_value(x / tf.cast(scale, tf.float16), -dtype_max, dtype_max)
   else:
     scaled_x = tf.clip_by_value(x / scale, -dtype_max, dtype_max)
+  #scaled_x = tf.clip_by_value(x / scale, -dtype_max, dtype_max)
   return tf.cast(scaled_x, quantized_dtype)
+
 
 def dequantize(x, wide_dtype, scale):
   return tf.cast(x, wide_dtype) * tf.cast(scale, wide_dtype)
+  #return tf.cast(x, wide_dtype) * scale
 
 
 def quantize_dequantize(x, quantized_dtype, scale):
@@ -74,7 +76,9 @@ def update_scale(x, quantized_dtype, scale_var, amax_history):
   dtype_max = get_fp8_max(quantized_dtype)
   amax_current = tf.cast(tf.math.reduce_max(tf.math.abs(x)), scale_var.dtype)
   amax_his_tsr = tf.tensor_scatter_nd_update(tf.roll(amax_history.read_value(), 1, 0),[[0]],[amax_current])
+ # print("yyyyyyyyyyyyyyyyyyyyyyyyyy", amax_his_tsr.dtype, amax_history.dtype)
   amax_history.assign(tf.cast(amax_his_tsr, amax_history.dtype))
+  #amax_history.assign(amax_his_tsr)
   amax_temp = tf.reduce_max(amax_history, axis=0)
   amax = tf.maximum(amax_temp, 2 ** -10)
   scale_var.assign(tf.cast(1.1 * amax / dtype_max,scale_var.dtype ))
@@ -182,7 +186,7 @@ class EinsumDenseFp8(Layer):
         activity_regularizer=None,
         kernel_constraint=None,
         bias_constraint=None,
-        use_variable=True,
+        is_last=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -199,7 +203,7 @@ class EinsumDenseFp8(Layer):
         self.bias_regularizer = regularizers.get(bias_regularizer)
         self.kernel_constraint = constraints.get(kernel_constraint)
         self.bias_constraint = constraints.get(bias_constraint)
-        self.use_variable = use_variable
+        self.is_last = is_last
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
@@ -249,11 +253,23 @@ class EinsumDenseFp8(Layer):
         self.input_grad_scale = self.add_weight("input_grad_scale", shape=(),
                                                 initializer=init_val,
                                                 trainable=False)
+        self.kernel_grad_scale = self.add_weight("kernel_grad_scale", shape=(),
+                                                initializer=init_val,
+                                                trainable=False)
+        self.kernel_grad_amax_history = self.add_weight(
+            "kernel_grad_amax_history", shape=(AMAX_HIS_LEN,),
+            initializer=init_val, trainable=False)
         self.output_grad_amax_history = self.add_weight(
             "output_grad_amax_history", shape=(AMAX_HIS_LEN,),
             initializer=init_val, trainable=False)
         self.output_grad_scale = self.add_weight(
             "output_grad_scale", shape=(),
+            initializer=init_val, trainable=False)
+        self.output_amax_history = self.add_weight(
+            "output_amax_history", shape=(AMAX_HIS_LEN,),
+            initializer=init_val, trainable=False)
+        self.output_scale = self.add_weight(
+            "output_scale", shape=(),
             initializer=init_val, trainable=False)
         super().build(input_shape)
 
@@ -294,7 +310,7 @@ class EinsumDenseFp8(Layer):
         return in_grad_ret
 
       return qin, grad
-  
+
     @tf.custom_gradient
     def out_qdq(self, output):
       """Quantize-dequantize both the output and the output's gradient, only if the next layer(in fwd sense) doesn't support fp8."""
@@ -305,7 +321,6 @@ class EinsumDenseFp8(Layer):
             output_grad_amax_history)
       return output, grad
 
-  
     @tf.custom_gradient
     def kernel_qdq(self, kernel):
       """Quantize-dequantize the kernel but not its gradient."""
@@ -320,12 +335,13 @@ class EinsumDenseFp8(Layer):
 
       return qkernel, grad
 
-
     def call(self, inputs):
-        ret = tf.einsum(self.equation, self.in_qdq(inputs), 
+#        print("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+#        print(inputs.shape, self.kernel.shape)
+        ret = tf.einsum(self.equation, self.in_qdq(inputs),
                         self.kernel_qdq(self.kernel))
         if self.is_last:
-            ret = self.out_qdq(ret)
+          ret = self.out_qdq(ret)
         if self.bias is not None:
             ret += self.bias
         if self.activation is not None:
