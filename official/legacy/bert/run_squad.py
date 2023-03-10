@@ -30,6 +30,7 @@ from official.legacy.bert import run_squad_helper
 from official.nlp.data import squad_lib as squad_lib_wp
 from official.nlp.tools import tokenization
 from official.utils.misc import keras_utils
+import DenseFp8 as dense_fp8
 import EinsumDenseFp8 as einsum_dense_fp8
 
 # hijack keras's EinsumDense layer
