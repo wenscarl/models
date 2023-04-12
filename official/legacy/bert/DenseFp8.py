@@ -37,6 +37,8 @@ E4M3_MAX = 448.
 E5M2_MAX = 57344.
 AMAX_HIS_LEN = 16
 
+init_val_scale = 1.0
+init_val_amax_history = 0.0
 
 def get_fp8_max(fake_dtype):
   if fake_dtype == FAKE_E4M3:
@@ -237,29 +239,31 @@ class DenseFp8(Layer):
             )
         else:
             self.bias = None
-        init32 = tf.keras.initializers.Constant(0.9)
+
+        init_scale = tf.keras.initializers.Constant(init_val_scale)
+        init_amax_history = tf.keras.initializers.Constant(init_val_amax_history)
         self.input_amax_history = self.add_weight(
             "input_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init32, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.input_scale = self.add_weight("input_scale", shape=(),
-                                           initializer=init32, trainable=False)
+                                           initializer=init_scale, trainable=False)
         self.kernel_amax_history = self.add_weight(
             "kernel_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init32, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.kernel_scale = self.add_weight("kernel_scale", shape=(),
-                                            initializer=init32, trainable=False)
+                                            initializer=init_scale, trainable=False)
         self.input_grad_amax_history = self.add_weight(
             "input_grad_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init32, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.input_grad_scale = self.add_weight("input_grad_scale", shape=(),
-                                                initializer=init32,
+                                                initializer=init_scale,
                                                 trainable=False)
         self.output_grad_amax_history = self.add_weight(
             "output_grad_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init32, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.output_grad_scale = self.add_weight(
             "output_grad_scale", shape=(),
-            initializer=init32, trainable=False)
+            initializer=init_scale, trainable=False)
         self.built = True
 
     @tf.custom_gradient
@@ -268,9 +272,7 @@ class DenseFp8(Layer):
       qin = qdq_and_update(input, FAKE_E4M3, self.input_scale, self.input_amax_history)
 
       def grad(in_grad):
-        in_grad_ret = qdq_and_update(in_grad, FAKE_E5M2, self.input_grad_scale,
-                                     self.input_grad_amax_history)
-        return in_grad_ret
+        return in_grad
 
       return qin, grad
 
@@ -361,14 +363,12 @@ class DenseFp8(Layer):
                 )
             else:
                 outputs = tf.matmul(a=self.in_qdq(inputs), b=self.kernel_qdq(self.kernel))
- #               if self.is_last:
- #                 outputs = self.out_qdq(outputs)
+                outputs = self.out_qdq(outputs)
         # Broadcast kernel to inputs.
         else:
         #    outputs = tf.tensordot(inputs, self.kernel, [[rank - 1], [0]])
             outputs = tf.matmul(a=self.in_qdq(inputs), b=self.kernel_qdq(self.kernel))
-#            if self.is_last:
-#              outputs = self.out_qdq(outputs)
+            outputs = self.out_qdq(outputs)
 # Reshape the output back to the original ndim of the input.
             if not tf.executing_eagerly():
                 shape = inputs.shape.as_list()
@@ -387,8 +387,6 @@ class DenseFp8(Layer):
 
         if self.activation is not None:
             outputs = self.activation(outputs)
-        if self.is_last:
-            outputs = self.out_qdq(outputs)
 
         if is_ragged:
             outputs = original_inputs.with_flat_values(outputs)

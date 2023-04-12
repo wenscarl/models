@@ -30,7 +30,8 @@ import keras.backend as K
 from tensorflow.python.util.tf_export import keras_export
 from tensorflow.python.framework import dtypes
 
-init_val_scalar = 0.8
+init_val_scale = 1.0
+init_val_amax_history = 0.0
 
 FAKE_E4M3 = dtypes.float8_e4m3fn
 FAKE_E5M2 = dtypes.float8_e5m2
@@ -186,7 +187,6 @@ class EinsumDenseFp8(Layer):
         activity_regularizer=None,
         kernel_constraint=None,
         bias_constraint=None,
-        is_last=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -203,7 +203,6 @@ class EinsumDenseFp8(Layer):
         self.bias_regularizer = regularizers.get(bias_regularizer)
         self.kernel_constraint = constraints.get(kernel_constraint)
         self.bias_constraint = constraints.get(bias_constraint)
-        self.is_last = is_last
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
@@ -236,41 +235,42 @@ class EinsumDenseFp8(Layer):
             )
         else:
             self.bias = None
-        init_val = tf.keras.initializers.Constant(init_val_scalar)
+        init_scale = tf.keras.initializers.Constant(init_val_scale)
+        init_amax_history = tf.keras.initializers.Constant(init_val_amax_history)
         self.input_amax_history = self.add_weight(
             "input_amax_history", shape=(AMAX_HIS_LEN,),
             initializer=init_val, trainable=False)
         self.input_scale = self.add_weight("input_scale", shape=(),
-                                           initializer=init_val, trainable=False)
+                                           initializer=init_scale, trainable=False)
         self.kernel_amax_history = self.add_weight(
             "kernel_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init_val, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.kernel_scale = self.add_weight("kernel_scale", shape=(),
-                                            initializer=init_val, trainable=False)
+                                            initializer=init_scale, trainable=False)
         self.input_grad_amax_history = self.add_weight(
             "input_grad_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init_val, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.input_grad_scale = self.add_weight("input_grad_scale", shape=(),
-                                                initializer=init_val,
+                                                initializer=init_scale,
                                                 trainable=False)
         self.kernel_grad_scale = self.add_weight("kernel_grad_scale", shape=(),
-                                                initializer=init_val,
+                                                initializer=init_scale,
                                                 trainable=False)
         self.kernel_grad_amax_history = self.add_weight(
             "kernel_grad_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init_val, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.output_grad_amax_history = self.add_weight(
             "output_grad_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init_val, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.output_grad_scale = self.add_weight(
             "output_grad_scale", shape=(),
-            initializer=init_val, trainable=False)
+            initializer=init_scale, trainable=False)
         self.output_amax_history = self.add_weight(
             "output_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init_val, trainable=False)
+            initializer=init_amax_history, trainable=False)
         self.output_scale = self.add_weight(
             "output_scale", shape=(),
-            initializer=init_val, trainable=False)
+            initializer=init_scale, trainable=False)
         super().build(input_shape)
 
     def compute_output_shape(self, _):
@@ -305,9 +305,7 @@ class EinsumDenseFp8(Layer):
       qin = qdq_and_update(input, FAKE_E4M3, self.input_scale, self.input_amax_history)
 
       def grad(in_grad):
-        in_grad_ret = qdq_and_update(in_grad, FAKE_E5M2, self.input_grad_scale,
-                                     self.input_grad_amax_history)
-        return in_grad_ret
+        return in_grad
 
       return qin, grad
 
@@ -340,8 +338,8 @@ class EinsumDenseFp8(Layer):
 #        print(inputs.shape, self.kernel.shape)
         ret = tf.einsum(self.equation, self.in_qdq(inputs),
                         self.kernel_qdq(self.kernel))
-        if self.is_last:
-          ret = self.out_qdq(ret)
+        
+        ret = self.out_qdq(ret)
         if self.bias is not None:
             ret += self.bias
         if self.activation is not None:
