@@ -239,7 +239,7 @@ class EinsumDenseFp8(Layer):
         init_amax_history = tf.keras.initializers.Constant(init_val_amax_history)
         self.input_amax_history = self.add_weight(
             "input_amax_history", shape=(AMAX_HIS_LEN,),
-            initializer=init_val, trainable=False)
+            initializer=init_val_amax_history, trainable=False)
         self.input_scale = self.add_weight("input_scale", shape=(),
                                            initializer=init_scale, trainable=False)
         self.kernel_amax_history = self.add_weight(
